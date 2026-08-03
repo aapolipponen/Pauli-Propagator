@@ -16,6 +16,7 @@ import pytest
 
 from pprop import Propagator  # noqa
 from pprop.propagator.binding import Free
+from pprop.propagator import utils
 from pprop.propagator.utils import build_ragged_arrays
 
 num_qubits = 3
@@ -409,6 +410,49 @@ def test_repeated_parameter_powers_agree_with_qml():
         )
 
 
+@pytest.mark.skipif(utils.Evaluator is None, reason="pprop_rs.Evaluator not built")
+def test_rust_and_numpy_evaluators_agree():
+    """
+    make_sparse_evaluator uses the Rust kernel when the extension provides it
+    and the NumPy implementation otherwise, so the two have to stay in step -
+    at ordinary angles, and at the zeros of sin/cos where the Rust side swaps
+    to its exact path and the NumPy side to its own.
+    """
+    def ansatz(params):
+        for layer in range(2):
+            for qubit in range(num_qubits):
+                qml.RX(params[3 * layer + qubit], wires=qubit)
+            qml.CNOT(wires=[0, 1])
+            qml.CNOT(wires=[1, 2])
+        return qml.expval(qml.PauliZ(0) @ qml.PauliX(1))
+
+    prop = Propagator(ansatz)
+    prop.propagate()
+    expr, n_internal = prop.exprs[0], prop._internal_num_params
+
+    rust_eval, rust_grad = utils.make_sparse_evaluator(expr, n_internal)
+    saved = utils.Evaluator
+    utils.Evaluator = None
+    try:
+        numpy_eval, numpy_grad = utils.make_sparse_evaluator(expr, n_internal)
+    finally:
+        utils.Evaluator = saved
+
+    rng = np.random.default_rng(0)
+    thetas = [rng.uniform(-np.pi, np.pi, prop.num_params) for _ in range(3)]
+    thetas.append(np.zeros(prop.num_params))                       # every sin at 0
+    thetas.append(np.full(prop.num_params, np.pi / 2))             # every cos at 0
+
+    for theta in thetas:
+        sins, coss = np.sin(theta), np.cos(theta)
+        assert np.isclose(rust_eval(sins, coss), numpy_eval(sins, coss),
+                          rtol=1e-12, atol=1e-14)
+        val_r, grad_r = rust_grad(sins, coss)
+        val_n, grad_n = numpy_grad(sins, coss)
+        assert np.isclose(val_r, val_n, rtol=1e-12, atol=1e-14)
+        assert np.allclose(grad_r, grad_n, rtol=1e-10, atol=1e-13)
+
+
 # %%
 test_propagator_agrees_with_qml()
 test_eval_n_jobs_matches_single_threaded()
@@ -419,3 +463,4 @@ test_propagator_beyond_64_qubits()
 test_fixed_value_gates_are_constant_folded()
 test_gradient_at_zeros_of_sin_and_cos()
 test_repeated_parameter_powers_agree_with_qml()
+test_rust_and_numpy_evaluators_agree()

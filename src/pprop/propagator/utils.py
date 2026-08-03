@@ -13,7 +13,8 @@ Provides:
   factors in one concatenated list, and fixed-value gate angles folded into the
   coefficients.
 - :func:`make_sparse_evaluator` -- compiles :data:`CoeffTerms` into fast numeric
-  callables built on the ragged arrays. This is the only evaluator
+  callables built on the ragged arrays, using ``pprop_rs.Evaluator`` when the
+  Rust extension provides it and NumPy otherwise. This is the only evaluator
   this fork keeps. It was measured ~6x faster than the removed dense
   ("standard") evaluator at typical k1/k2 truncation levels, and the removed
   JAX/vmap evaluator was consistently slower on CPU (see git history and the
@@ -28,6 +29,11 @@ import numpy as np
 from pennylane.operation import Observable
 
 from ..pauli.sentence import CoeffTerms
+
+try:
+    from pprop_rs import Evaluator
+except ImportError:  # the NumPy implementation below is the fallback
+    Evaluator = None
 
 
 def requires_propagation(method: Callable) -> Callable:
@@ -277,6 +283,24 @@ def build_ragged_arrays(
             np.asarray(cnt, dtype=np.int64))
 
 
+def _make_rust_evaluator(coeffs, idx, cnt, num_params, tol):
+    """Wrap :class:`pprop_rs.Evaluator` in the same pair of callables."""
+    kernel = Evaluator(coeffs, idx.astype(np.uint32), cnt.astype(np.uint32),
+                       num_params, tol)
+    grad = np.empty(num_params)
+
+    def _eval(sins: np.ndarray, coss: np.ndarray) -> float:
+        return kernel.eval(np.asarray(sins, dtype=np.float64),
+                           np.asarray(coss, dtype=np.float64))
+
+    def _eval_grad(sins: np.ndarray, coss: np.ndarray) -> Tuple[float, np.ndarray]:
+        value = kernel.eval_and_grad(np.asarray(sins, dtype=np.float64),
+                                     np.asarray(coss, dtype=np.float64), grad)
+        return value, grad.copy()
+
+    return _eval, _eval_grad
+
+
 def _make_ragged_evaluator(expr, num_params, fixed_value_slots, tol):
     """Build the ``(eval, eval_grad)`` pair for one block of terms."""
     coeffs, idx, cnt = build_ragged_arrays(expr, num_params, fixed_value_slots)
@@ -287,6 +311,9 @@ def _make_ragged_evaluator(expr, num_params, fixed_value_slots, tol):
         zero = np.zeros(num_params)
         return (lambda sins, coss: 0.0,
                 lambda sins, coss: (0.0, zero.copy()))
+
+    if Evaluator is not None:
+        return _make_rust_evaluator(coeffs, idx, cnt, num_params, tol)
 
     cos_offset = num_params + 1
     # Start offset of each term's run, for np.multiply.reduceat, and the
@@ -375,6 +402,12 @@ def make_sparse_evaluator(
     and one :func:`numpy.multiply.reduceat` pass, and the gradient reduces to a
     single :func:`numpy.bincount` over the factors followed by one multiply
     over the parameter vector.
+
+    The same arithmetic runs in ``pprop_rs.Evaluator`` whenever the Rust
+    extension provides it, which is faster again because the per-pass
+    temporaries disappear; the NumPy version above is the reference
+    implementation and the fallback for an extension built before it existed.
+    ``tests/test_backends.py`` checks the two against each other.
 
     Like :func:`make_evaluator`, the returned callables take precomputed
     ``sins = sin(theta)``/``coss = cos(theta)`` rather than ``theta`` -
